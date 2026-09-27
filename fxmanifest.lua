@@ -44,13 +44,11 @@ server_scripts {
 }
 
 shared_scripts {
+    '@ox_lib/init.lua',
     'config.lua',
     'resource/shared.lua',
     'links/frameworks/shared.lua',
     'links/inventories/shared.lua',
-
-    '@ox_lib/init.lua',
-    '@ox_core/lib/init.lua',
 }
 
 client_scripts {
