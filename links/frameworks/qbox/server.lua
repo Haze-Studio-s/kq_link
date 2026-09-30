@@ -66,57 +66,205 @@ local function ParseAccount(account)
     return ACCOUNT_ALIASES[account] or account
 end
 
+local _bootNonce = string.format("%x", math.random(0x1000, 0xffff))
+local _opSeq = 0
+
+local function normalizeAmount(value)
+    local amount = tonumber(value)
+    if not amount or amount ~= amount or amount == math.huge or amount == -math.huge then
+        return nil
+    end
+    local rounded = math.floor(amount + 0.5)
+    if rounded <= 0 or rounded > 2147483647 then
+        return nil
+    end
+    return rounded
+end
+
+local function makeOpId(action, cid, ref)
+    local safeAct = tostring(action or "tx"):gsub("[^%w_]", "_"):sub(1, 16)
+    local safeCid = tostring(cid or "sys"):gsub("[^%w_]", "_"):sub(1, 18)
+    if ref and ref ~= "" then
+        local safeRef = tostring(ref):gsub("[^%w_]", "_"):sub(1, 24)
+        return string.format("kq:%s:%s:%s", safeAct, safeCid, safeRef):sub(1, 64)
+    end
+    _opSeq = (_opSeq + 1) % 1000000
+    return string.format("kq:%s:%s:%s:%d", safeAct, safeCid, _bootNonce, _opSeq):sub(1, 64)
+end
+
+local function getPlayerMoney(player, account)
+    local src = tonumber(player)
+    if not src then return 0 end
+    account = ParseAccount(account) or 'cash'
+
+    if account == 'bank' then
+        if GetResourceState('aust_banking') == 'started' then
+            local cid = GetPlayerCharacterId(src)
+            if cid then
+                local ok, bal = pcall(function() return exports.aust_banking:GetBankBalance(cid) end)
+                if ok and type(bal) == 'number' then return bal end
+            end
+        end
+        return exports.qbx_core:GetMoney(src, 'bank') or 0
+    end
+
+    -- 'cash'
+    if GetResourceState('ox_inventory') == 'started' then
+        local ok, count = pcall(function() return exports.ox_inventory:GetItemCount(src, 'money') end)
+        if ok and type(count) == 'number' then return count end
+    end
+    return exports.qbx_core:GetMoney(src, 'cash') or 0
+end
+
 function CanPlayerAfford(player, amount, account)
+    local cleanAmount = normalizeAmount(amount)
+    if not cleanAmount then return false end
     account = ParseAccount(account)
 
     if account then
-        return exports.qbx_core:GetMoney(player, account) >= amount
+        return getPlayerMoney(player, account) >= cleanAmount
     end
 
-    if exports.qbx_core:GetMoney(player, 'cash') >= amount then
+    if getPlayerMoney(player, 'cash') >= cleanAmount then
         return true
     end
 
-    if exports.qbx_core:GetMoney(player, 'bank') >= amount then
+    if getPlayerMoney(player, 'bank') >= cleanAmount then
         return true
     end
 
     return false
 end
 
-function AddPlayerMoney(player, amount, account)
-    local xPlayer = exports.qbx_core:GetPlayer(player)
+function AddPlayerMoney(player, amount, account, opts)
+    local src = tonumber(player)
+    if not src then return false end
+    local cleanAmount = normalizeAmount(amount)
+    if not cleanAmount then return false end
 
-    if not xPlayer then
+    account = ParseAccount(account) or 'cash'
+    opts = opts or {}
+    local note = opts.reason or opts.note or 'kq_link'
+
+    if account == 'bank' then
+        local cid = GetPlayerCharacterId(src)
+        if GetResourceState('aust_banking') == 'started' and cid then
+            local opId = opts.operationId or opts.operation_id or makeOpId('credit', cid, opts.ref)
+            local ok, res = pcall(function()
+                return exports.aust_banking:Credit({
+                    citizenid    = cid,
+                    amount       = cleanAmount,
+                    reason       = note,
+                    note         = note,
+                    operationId  = opId,
+                    operation_id = opId,
+                    source       = 'kq_link',
+                })
+            end)
+            if ok and (res == true or (type(res) == 'table' and (res.ok == true or res.success == true))) then
+                return true
+            end
+            return false
+        end
+        local xPlayer = exports.qbx_core:GetPlayer(src)
+        return xPlayer and xPlayer.Functions and xPlayer.Functions.AddMoney('bank', cleanAmount, note) == true
+    end
+
+    -- 'cash'
+    if GetResourceState('ox_inventory') == 'started' then
+        local okCarry, canCarry = pcall(function()
+            return exports.ox_inventory:CanCarryItem(src, 'money', cleanAmount)
+        end)
+        if okCarry and canCarry then
+            local okAdd, added = pcall(function()
+                return exports.ox_inventory:AddItem(src, 'money', cleanAmount)
+            end)
+            if okAdd and added then
+                return true
+            end
+        end
+        -- Overflow para conta bancária caso bolsa esteja no limite físico
+        local cid = GetPlayerCharacterId(src)
+        if GetResourceState('aust_banking') == 'started' and cid then
+            local opId = opts.operationId or opts.operation_id or makeOpId('overflow', cid, opts.ref)
+            local ok, res = pcall(function()
+                return exports.aust_banking:Credit({
+                    citizenid    = cid,
+                    amount       = cleanAmount,
+                    reason       = note .. ' (overflow)',
+                    note         = note,
+                    operationId  = opId,
+                    operation_id = opId,
+                    source       = 'kq_link',
+                })
+            end)
+            if ok and (res == true or (type(res) == 'table' and (res.ok == true or res.success == true))) then
+                return true
+            end
+        end
         return false
     end
 
-    return xPlayer.Functions.AddMoney(ParseAccount(account) or 'cash', amount)
+    local xPlayer = exports.qbx_core:GetPlayer(src)
+    return xPlayer and xPlayer.Functions and xPlayer.Functions.AddMoney('cash', cleanAmount, note) == true
 end
 
-function RemovePlayerMoney(player, amount, account)
-    account = ParseAccount(account)
+function RemovePlayerMoney(player, amount, account, opts)
+    local src = tonumber(player)
+    if not src then return false end
+    local cleanAmount = normalizeAmount(amount)
+    if not cleanAmount then return false end
 
-    if not CanPlayerAfford(player, amount, account) then
+    account = ParseAccount(account)
+    opts = opts or {}
+    local note = opts.reason or opts.note or 'kq_link'
+
+    if not account then
+        if CanPlayerAfford(src, cleanAmount, 'cash') then
+            account = 'cash'
+        elseif CanPlayerAfford(src, cleanAmount, 'bank') then
+            account = 'bank'
+        else
+            return false
+        end
+    end
+
+    if not CanPlayerAfford(src, cleanAmount, account) then
         return false
     end
 
-    if account then
-        exports.qbx_core:RemoveMoney(player, account, amount)
-        return true
+    if account == 'bank' then
+        local cid = GetPlayerCharacterId(src)
+        if GetResourceState('aust_banking') == 'started' and cid then
+            local opId = opts.operationId or opts.operation_id or makeOpId('debit', cid, opts.ref)
+            local ok, res = pcall(function()
+                return exports.aust_banking:Debit({
+                    citizenid    = cid,
+                    amount       = cleanAmount,
+                    reason       = note,
+                    note         = note,
+                    operationId  = opId,
+                    operation_id = opId,
+                    source       = 'kq_link',
+                })
+            end)
+            if ok and (res == true or (type(res) == 'table' and (res.ok == true or res.success == true))) then
+                return true
+            end
+            return false
+        end
+        return exports.qbx_core:RemoveMoney(src, 'bank', cleanAmount, note) == true
     end
 
-    if exports.qbx_core:GetMoney(player, 'cash') >= amount then
-        exports.qbx_core:RemoveMoney(player, 'cash', amount)
-        return true
+    -- 'cash'
+    if GetResourceState('ox_inventory') == 'started' then
+        local okRem, rem = pcall(function()
+            return exports.ox_inventory:RemoveItem(src, 'money', cleanAmount)
+        end)
+        return okRem and (rem and true or false)
     end
 
-    if exports.qbx_core:GetMoney(player, 'bank') >= amount then
-        exports.qbx_core:RemoveMoney(player, 'bank', amount)
-        return true
-    end
-
-    return false
+    return exports.qbx_core:RemoveMoney(src, 'cash', cleanAmount, note) == true
 end
 
 if Link.inventory == 'framework' then
